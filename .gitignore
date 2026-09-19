@@ -1,0 +1,7 @@
+# Credentials - never commit
+secrets.h
+
+# Editor temp files
+*~
+\#*\#
+.DS_Store
