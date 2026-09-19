@@ -1,3 +1,4 @@
+#include <esp_task_wdt.h>
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Wire.h>
@@ -22,11 +23,20 @@ struct Station {
 };
 
 const Station stations[] = {
-  {"Radio Suno 91.7",   "https://playerservices.streamtheworld.com/api/livestream-redirect/SUNO917.mp3"},
+  // ── Others ───────────────────────────────────────────────────────────────
+  {"Malayalam 98.6",    "https://stream.zeno.fm/512rbf1e3qzuv"},
   {"Aaha FM Radio",     "http://s2.radio.co/s3801784f1/listen"},
   {"Aural Oldies",      "http://stream.zeno.fm/anrf216cu68uv"},
   {"Chitra Hits",       "http://stream.zeno.fm/dubvcz3rkrhvv"},
-  {"Malayalam 98.6",    "https://stream.zeno.fm/512rbf1e3qzuv"}
+  // ── Malayalam / Kerala (AIR) ──────────────────────────────────────────────
+  // Direct CloudFront URLs — wavespb.com does 302 redirect which ESP32 can't follow
+  {"AIR Malayalam",     "https://d1cvqgmbcpg5yn.cloudfront.net/6ff13de7ea9b53d7/6ff13de7ea9b53d7.m3u8"},
+  {"AIR Trivandrum",    "https://d1cvqgmbcpg5yn.cloudfront.net/ad3a8436a329e2d6/ad3a8436a329e2d6.m3u8"},
+  {"AIR Kochi",         "https://d1cvqgmbcpg5yn.cloudfront.net/70400e7510e87cdf/70400e7510e87cdf.m3u8"},
+  {"FM Rainbow Kochi",  "https://d1tmej9eu7kw5c.cloudfront.net/7df6f2a8c3c4d33b/7df6f2a8c3c4d33b.m3u8"},
+  {"AIR Kozhikode",     "https://d1cvqgmbcpg5yn.cloudfront.net/8321393de70015fc/8321393de70015fc.m3u8"},
+  {"Kozhikode Real FM", "https://d1cvqgmbcpg5yn.cloudfront.net/b69c296065db7627/b69c296065db7627.m3u8"},
+  {"Raagam",            "https://airhlspush.pc.cdn.bitgravity.com/httppush/hlspbaudioragam/hlspbaudioragam64kbps.m3u8"}
 };
 
 const int NUM_STATIONS = sizeof(stations) / sizeof(stations[0]);
@@ -66,25 +76,24 @@ public:
       cfg.pin_hsync   = GPIO_NUM_40;
       cfg.pin_pclk    = GPIO_NUM_39;
 
-      // Native 16MHz clock keeps the ST7262 internal PLL locked
-      cfg.freq_write = 16000000;
+      // Native 14MHz pixel clock with tuned porches
+      cfg.freq_write = 14000000;
 
-// Horizontal timings adjusted to 860 total clocks for solid line latching:
-      cfg.hsync_polarity    = 0;
-      cfg.hsync_front_porch = 20;   // Increased from 8 to give the line counter breathing room
-      cfg.hsync_pulse_width = 8;    // Widened from 4 for an unambiguous sync edge
-      cfg.hsync_back_porch  = 32;   // Adjusted back porch
-
-
-      // Exact ST7262 factory vertical timings (498 lines total)
+      // Vertical porches
       cfg.vsync_polarity    = 0;
-      cfg.vsync_front_porch = 4;
-      cfg.vsync_pulse_width = 4;
-      cfg.vsync_back_porch  = 10;
+      cfg.vsync_front_porch = 8;
+      cfg.vsync_pulse_width = 8;
+      cfg.vsync_back_porch  = 16;
 
-      cfg.pclk_idle_high  = 1;
-      cfg.pclk_active_neg = 0;  // Rising-edge data latch prevents sync phase jitter
-      cfg.de_idle_high    = 0;
+      // Horizontal timing
+      cfg.hsync_polarity    = 0;
+      cfg.hsync_front_porch = 12;
+      cfg.hsync_pulse_width = 8;
+      cfg.hsync_back_porch  = 8;
+
+      cfg.pclk_idle_high    = 1;
+      cfg.pclk_active_neg   = 0;
+      cfg.de_idle_high      = 0;
 
       _bus_instance.config(cfg);
     }
@@ -97,6 +106,10 @@ public:
       cfg.panel_height  = 480;
       cfg.offset_x      = 0;
       cfg.offset_y      = 0;
+
+      // Allocate internal DMA line buffers to insulate LCD stream from PSRAM bursts
+      cfg.bus_shared = true;
+
       _panel_instance.config(cfg);
     }
 
@@ -125,25 +138,41 @@ public:
 };
 
 volatile int requestedStation = -1; // -1 means no pending change
+volatile int requestedVolume  = -1;
+
 LGFX gfx;
 Audio audio;
 
 // =============================================================================
 // State & Layout Tracking
 // =============================================================================
-int currentStation = 0;
-int currentVolume  = 15; // 0 to 21
+int currentStation   = 0;
+int currentVolume    = 10; // 0 to 21
 String currentTrackTitle = "Connecting...";
 unsigned long lastTouchTime = 0;
 
-const int BTN_X = 25;
-const int BTN_W = 240;
-const int BTN_H = 55;
-const int BTN_GAP = 12;
+// Viewport / Scrolling Configuration
+const int VISIBLE_STATIONS = 5;  // Show 5 items at a time
+int listTopIndex           = 0;  // First visible index in view
+
+const int BTN_X   = 25;
+const int BTN_W   = 240;
+const int BTN_H   = 52;
+const int BTN_GAP = 8;
 
 // =============================================================================
-// Helper Functions for Hardware Power Management
+// Helpers
 // =============================================================================
+String clampText(const String& str, unsigned int maxLen) {
+  if (str.length() <= maxLen) {
+    return str;
+  }
+  if (maxLen > 3) {
+    return str.substring(0, maxLen - 3) + "...";
+  }
+  return str.substring(0, maxLen);
+}
+
 bool i2cScanForAddress(uint8_t address) {
   Wire.beginTransmission(address);
   return (Wire.endTransmission() == 0);
@@ -164,19 +193,48 @@ void sendI2CCommand(uint8_t command) {
 // UI Drawing
 // =============================================================================
 void drawStationButtons() {
-  for (int i = 0; i < NUM_STATIONS; i++) {
-    int y = 90 + i * (BTN_H + BTN_GAP);
-    if (i == currentStation) {
-      gfx.fillRoundRect(BTN_X, y, BTN_W, BTN_H, 8, gfx.color565(0, 120, 215));
-      gfx.drawRoundRect(BTN_X, y, BTN_W, BTN_H, 8, TFT_WHITE);
+  // Draw the 5 visible station slots
+  for (int row = 0; row < VISIBLE_STATIONS; row++) {
+    int stIdx = listTopIndex + row;
+    int y = 90 + row * (BTN_H + BTN_GAP);
+
+    if (stIdx < NUM_STATIONS) {
+      if (stIdx == currentStation) {
+        gfx.fillRoundRect(BTN_X, y, BTN_W, BTN_H, 8, gfx.color565(0, 120, 215));
+        gfx.drawRoundRect(BTN_X, y, BTN_W, BTN_H, 8, TFT_WHITE);
+      } else {
+        gfx.fillRoundRect(BTN_X, y, BTN_W, BTN_H, 8, gfx.color565(38, 38, 44));
+        gfx.drawRoundRect(BTN_X, y, BTN_W, BTN_H, 8, gfx.color565(65, 65, 75));
+      }
+      gfx.setTextColor(TFT_WHITE);
+      gfx.setTextSize(1.8);
+      gfx.drawCenterString(stations[stIdx].name, BTN_X + (BTN_W / 2), y + 17);
     } else {
-      gfx.fillRoundRect(BTN_X, y, BTN_W, BTN_H, 8, gfx.color565(38, 38, 44));
-      gfx.drawRoundRect(BTN_X, y, BTN_W, BTN_H, 8, gfx.color565(65, 65, 75));
+      // Clear trailing empty slots if stations count is small
+      gfx.fillRect(BTN_X, y, BTN_W, BTN_H, gfx.color565(18, 18, 22));
     }
-    gfx.setTextColor(TFT_WHITE);
-    gfx.setTextSize(2);
-    gfx.drawCenterString(stations[i].name, BTN_X + (BTN_W / 2), y + 18);
   }
+
+  // Draw Viewport Scroll Up / Down Buttons below the station list
+  int scrollBtnY = 90 + VISIBLE_STATIONS * (BTN_H + BTN_GAP) + 5; // Y: 395
+  int halfW = (BTN_W - 10) / 2; // ~115px each
+
+  // Scroll UP button
+  uint16_t upColor = (listTopIndex > 0) ? gfx.color565(55, 55, 68) : gfx.color565(30, 30, 35);
+  gfx.fillRoundRect(BTN_X, scrollBtnY, halfW, 50, 8, upColor);
+  gfx.drawRoundRect(BTN_X, scrollBtnY, halfW, 50, 8, gfx.color565(80, 80, 95));
+  gfx.setTextColor(listTopIndex > 0 ? TFT_WHITE : gfx.color565(90, 90, 100));
+  gfx.setTextSize(2.2);
+  gfx.drawCenterString("▲ UP", BTN_X + (halfW / 2), scrollBtnY + 16);
+
+  // Scroll DOWN button
+  bool canScrollDown = (listTopIndex + VISIBLE_STATIONS < NUM_STATIONS);
+  uint16_t dnColor = canScrollDown ? gfx.color565(55, 55, 68) : gfx.color565(30, 30, 35);
+  gfx.fillRoundRect(BTN_X + halfW + 10, scrollBtnY, halfW, 50, 8, dnColor);
+  gfx.drawRoundRect(BTN_X + halfW + 10, scrollBtnY, halfW, 50, 8, gfx.color565(80, 80, 95));
+  gfx.setTextColor(canScrollDown ? TFT_WHITE : gfx.color565(90, 90, 100));
+  gfx.setTextSize(2.2);
+  gfx.drawCenterString("▼ DN", BTN_X + halfW + 10 + (halfW / 2), scrollBtnY + 16);
 }
 
 void drawNowPlayingCard() {
@@ -286,12 +344,13 @@ void handleTouch() {
   if (millis() - lastTouchTime < 250) return; // Debounce
   lastTouchTime = millis();
 
-// 1. Station Buttons
-  for (int i = 0; i < NUM_STATIONS; i++) {
-    int y = 90 + i * (BTN_H + BTN_GAP);
+  // 1. Station Button Clicks (Rows 0 to VISIBLE_STATIONS - 1)
+  for (int row = 0; row < VISIBLE_STATIONS; row++) {
+    int y = 90 + row * (BTN_H + BTN_GAP);
     if (touchX >= BTN_X && touchX <= (BTN_X + BTN_W) && touchY >= y && touchY <= (y + BTN_H)) {
-      if (currentStation != i) {
-        currentStation = i;
+      int selectedIdx = listTopIndex + row;
+      if (selectedIdx < NUM_STATIONS && currentStation != selectedIdx) {
+        currentStation = selectedIdx;
         currentTrackTitle = "Connecting...";
 
         drawStationButtons();
@@ -304,12 +363,34 @@ void handleTouch() {
     }
   }
 
-  // 2. Volume Buttons
+  // 2. Viewport Scroll Buttons (Y: 395-445)
+  int scrollBtnY = 90 + VISIBLE_STATIONS * (BTN_H + BTN_GAP) + 5;
+  int halfW = (BTN_W - 10) / 2;
+
+  // Scroll UP button
+  if (touchX >= BTN_X && touchX <= (BTN_X + halfW) && touchY >= scrollBtnY && touchY <= (scrollBtnY + 50)) {
+    if (listTopIndex > 0) {
+      listTopIndex--;
+      drawStationButtons();
+    }
+    return;
+  }
+
+  // Scroll DOWN button
+  if (touchX >= (BTN_X + halfW + 10) && touchX <= (BTN_X + BTN_W) && touchY >= scrollBtnY && touchY <= (scrollBtnY + 50)) {
+    if (listTopIndex + VISIBLE_STATIONS < NUM_STATIONS) {
+      listTopIndex++;
+      drawStationButtons();
+    }
+    return;
+  }
+
+  // 3. Volume Buttons
   int volY = 385;
   if (touchX >= 360 && touchX <= 435 && touchY >= volY && touchY <= (volY + 60)) {
     if (currentVolume > 0) {
       currentVolume--;
-      audio.setVolume(currentVolume);
+      requestedVolume = currentVolume; // Hand off to Core 0
       updateVolumeDisplay();
     }
     return;
@@ -317,7 +398,7 @@ void handleTouch() {
   if (touchX >= 635 && touchX <= 710 && touchY >= volY && touchY <= (volY + 60)) {
     if (currentVolume < 21) {
       currentVolume++;
-      audio.setVolume(currentVolume);
+      requestedVolume = currentVolume; // Hand off to Core 0
       updateVolumeDisplay();
     }
     return;
@@ -330,19 +411,65 @@ void handleTouch() {
 TaskHandle_t audioTaskHandle = NULL;
 
 void audioTask(void *pvParameters) {
+  // Suppress watchdog on Core 0 for long streaming operations
+  #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+    esp_task_wdt_delete(NULL);
+  #else
+    esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
+  #endif
+
   for (;;) {
-    // Handle station change safely inside the audio thread
     if (requestedStation >= 0) {
       int nextStation = requestedStation;
       requestedStation = -1;
+
       audio.stopSong();
-      vTaskDelay(pdMS_TO_TICKS(50)); // Allow sockets and buffers to flush
+      vTaskDelay(pdMS_TO_TICKS(100));
+
       audio.connecttohost(stations[nextStation].url);
     }
 
+    if (requestedVolume >= 0) {
+      audio.setVolume(requestedVolume);
+      requestedVolume = -1;
+    }
+
     audio.loop();
-    taskYIELD();
+    vTaskDelay(pdMS_TO_TICKS(2)); // Grants LCD DMA priority on the shared bus
   }
+}
+
+// =============================================================================
+// Audio Callback (ESP32-audioI2S v3.x Unified Event System)
+// =============================================================================
+void setupAudioCallbacks() {
+  Audio::audio_info_callback = [](Audio::msg_t m) {
+    if (!m.msg) return;
+
+    Serial.printf("[%s] %s\n", m.s ? m.s : "INFO", m.msg);
+
+    if (m.s != nullptr) {
+      String evt = String(m.s);
+      if (evt.equalsIgnoreCase("streamtitle") || 
+          evt.equalsIgnoreCase("stationname") || 
+          evt.equalsIgnoreCase("icy_name") ||
+          evt.equalsIgnoreCase("name")) {
+        
+        if (strlen(m.msg) > 0) {
+          currentTrackTitle = clampText(String(m.msg), 40);
+          updateMetadataText();
+        }
+      }
+    }
+    
+    if (currentTrackTitle == "Connecting..." && m.s != nullptr) {
+      String evt = String(m.s);
+      if (evt.equalsIgnoreCase("bitrate") || evt.equalsIgnoreCase("sample_rate")) {
+        currentTrackTitle = "Playing";
+        updateMetadataText();
+      }
+    }
+  };
 }
 
 // =============================================================================
@@ -372,7 +499,7 @@ void setup() {
     retries++;
   }
 
-  // Power on speaker power amplifier
+  // Power on speaker amplifier
   sendI2CCommand(248);
 
   // Turn on screen backlight (0 = max brightness)
@@ -414,39 +541,26 @@ void setup() {
     Serial.println("[OK] I2S Pins configured");
   }
 
+  audio.setConnectionTimeout(2500, 2500); // 2.5s connect timeout, 2.5s read timeout
   audio.setVolume(currentVolume);
 
-  if (WiFi.status() == WL_CONNECTED) {
-    audio.connecttohost(stations[currentStation].url);
-  }
+  setupAudioCallbacks();
 
-  // Pin audio playback and decoding to Core 0 (Priority 1: below Wi-Fi driver)
+  // Hand off initial tuning to audioTask on Core 0 (has an 80KB stack for SSL)
+  requestedStation = currentStation;
+
   xTaskCreatePinnedToCore(
     audioTask,         // Function to implement the task
     "audioTask",       // Name of the task
-    8192,              // Stack size in words
+    20480,             // Stack size in words (80KB)
     NULL,              // Task input parameter
     1,                 // Priority 1
     &audioTaskHandle,  // Task handle
     0                  // Core 0
-  );  
+  );
 }
 
 void loop() {
   handleTouch();
   delay(10);
-}
-
-// =============================================================================
-// Audio Callbacks
-// =============================================================================
-void audio_showstreamtitle(const char* info) {
-  if (info && strlen(info) > 0) {
-    currentTrackTitle = String(info);
-    updateMetadataText();
-  }
-}
-
-void audio_info(const char* info) {
-  Serial.printf("[AUDIO] %s\n", info);
 }
