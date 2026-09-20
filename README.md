@@ -14,5 +14,10 @@ Bluetooth speaker with FFT spectrum visualizer for the AITRIP CYD (ESP32-2432S02
 Stock ticker (AAPL / NVDA / TSLA) with live Finnhub data, no-flicker display.
 Built for the AITRIP ESP32 CYD (ILI9341, 320×240).
 
+### cyd_spectrum_max98357
+FFT spectrum analyser for the AITRIP CYD (ESP32-2432S028R) with a MAX98357A I2S amplifier.
+Replaces the CYD's weak built-in DAC with a 3W external amp for full-resolution audio output.
+Wiring uses the SPI peripheral connector (IO27 BCLK, IO18 LRC, IO23 DIN); microSD slot unavailable while connected.
+
 ### crowpanel_wifi_dashboard
 WiFi dashboard for the Elecrow CrowPanel 7" ESP32-S3 HMI (800×480, LovyanGFX).
